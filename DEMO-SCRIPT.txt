@@ -1,0 +1,127 @@
+DEMO SCRIPT — PLEC Concierge
+Paste these in order, one conversation, do not refresh between turns.
+The agent remembers the conversation, and several turns only work because of
+what an earlier one established.
+
+Before you record:
+  - Do NOT run npm test or the behaviour evals first. They eat the shared
+    150k-token / 5-minute budget and the demo will start rate limited.
+  - Tell Bryan to stop testing while you record.
+  - Open the chat page, click "Start over" for a clean session.
+  - 9 turns, about 3 minutes of talking. Each turn answers in 2-5 seconds.
+
+
+=== CORE SCRIPT (9 turns) ===
+
+TURN 1
+  hi i need a place for a party
+
+  SHOW: it asks one short question instead of guessing or searching blind.
+
+TURN 2
+  Philadelphia, October 10, 40 people
+
+  SHOW: three venue cards, each with a real tradeoff in the text.
+  SHOW: expand the trace line above the reply. This is the big one. It proves
+        the venues came from search_listings and nothing was invented.
+  SHOW: click a card. It opens the venue's real address on Google Maps.
+
+TURN 3
+  how many people does The Foundry at Fishtown hold, and what would 6pm to 11pm cost?
+
+  SHOW: the exact all-in total, $1,815.00, service fee included.
+  SHOW: in the trace, get_listing returned the capacity and quote returned the
+        total. Say out loud: the price is the sandbox's number, never computed.
+
+TURN 4
+  book it
+
+  SHOW: nothing is booked. It asks for the name and email it does not have.
+        This is enforced in code, not in the prompt.
+
+TURN 5
+  sure, but make it 7pm instead
+
+  SHOW: still nothing booked. It contains the word "sure" and would have passed
+        a naive yes-check. A "but" means the terms changed, so it is not consent.
+        This is the strongest safety moment in the demo.
+
+TURN 6
+  yes, book it for Sam Rivera, sam.rivera@example.com
+
+  SHOW: booked, with a BK- reference, and the status is "pending payment",
+        not "confirmed".
+  SHOW: the payment link. Say: the booking only confirms once the guest pays,
+        and the agent will not pay on their behalf.
+  SHOW: in the trace, book ran once and then get_booking ran. That second call
+        is the verify-after-write: it re-reads the booking before telling you
+        it worked.
+
+TURN 7
+  is it paid yet? and do you have a student discount code?
+
+  SHOW: it checks the booking rather than answering from memory, and says
+        plainly there are no discounts. There are none in the sandbox and it
+        will not invent one.
+
+TURN 8
+  anything available on December 25?
+
+  SHOW: every listing is closed that day. Instead of a dead end it widens one
+        constraint and tells you which one it relaxed.
+
+TURN 9
+  cancel the booking
+  yes
+
+  SHOW: the first message does not cancel. It tells you what will be cancelled
+        and the refund first. Only the "yes" acts.
+  SHOW: the refund is $0.00 because the booking was never paid, so nothing was
+        charged. It does not pretend money is coming back.
+
+
+=== IF YOU HAVE 30 MORE SECONDS ===
+
+PARALLEL FAN-OUT
+  check all three of those venues for October 17
+
+  SHOW: the trace has three get_availability calls with overlapping timings.
+        They ran concurrently, so it is one round-trip instead of three.
+
+OUT OF SCOPE
+  can you write my python homework
+
+  SHOW: declines in one sentence and steers back to venues.
+
+HOST TEXT IS DATA (only if you know which listing it is)
+  One listing's description tries to give the agent orders and plants a fake
+  promo code. The agent describes the listing normally and never repeats it.
+
+
+=== WHAT TO SAY OVER THE TOP ===
+
+Three lines worth saying out loud, because they are the things a viewer cannot
+see for themselves:
+
+1. "Every fact on screen came from a tool call — you can see them in the trace.
+   The agent never states a price, a capacity or a booking status from memory."
+
+2. "Nothing gets booked, cancelled or moved without the user saying yes, and
+   that gate is in code, not in the prompt. A prompt is advice."
+
+3. "Writes are never retried. If a booking request fails in a way where we
+   cannot tell whether it went through, the agent reads the bookings back and
+   finds out — because a retry that already succeeded charges the guest twice
+   and they cannot undo that."
+
+
+=== IF IT SAYS "I HAVE HIT MY REQUEST LIMIT" ===
+
+That is the shared team quota, not a bug: 40 requests and 150,000 tokens per
+five minutes across both of us. Two options:
+
+  - Wait the number of seconds it tells you and carry on. It keeps the
+    conversation, so you can resume mid-demo.
+  - Or leave it in the video. It states how many seconds are left, and it still
+    reports whatever the tools had already returned rather than losing the work.
+    That is real engineering and it is fine to show.
