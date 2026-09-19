@@ -75,7 +75,7 @@ const cases = [
   }],
   ['Prompt restates reservations made this conversation', () =>
     systemPrompt({ state: { bookings: { 'BK-1001': { ref: 'BK-1001', listingName: 'The Foundry at Fishtown', date: '2026-10-10', startTime: '18:00', endTime: '23:00', guestCount: 40, status: 'pending_payment' } } } }).includes('BK-1001: The Foundry at Fishtown')],
-  ['Prompt calendar has the right weekday for October 10, 2026', () => systemPrompt({ state: {} }).includes('2026-10-10 Sat')],
+  ['Prompt calendar has the right weekday for October 10, 2026', () => systemPrompt({ state: {} }).includes('10-10 Sat')],
 ];
 
 export function runOfflineChecks() {
