@@ -168,6 +168,7 @@ async function runTurn({ text, session, deadline }) {
 
     if (reply.toolCalls.length === 0) {
       session.messages.push({ role: 'assistant', content: reply.text });
+      await addMapLinks(session, turn, reply.text);
       return buildParts(reply.text, session, turn);
     }
 
@@ -200,7 +201,13 @@ async function runTurn({ text, session, deadline }) {
  * on explicit tool descriptions instead of a low temperature.
  */
 async function askModel(session, remainingMs, withTools) {
-  const messages = [{ role: 'system', content: systemPrompt(session) }, ...session.messages];
+  compressOldToolResults(session);
+  // `shrunk` is our own bookkeeping and not part of the OpenAI message shape, so
+  // it is dropped on the way out rather than risking a 400 on an unknown field.
+  const messages = [
+    { role: 'system', content: systemPrompt(session) },
+    ...session.messages.map(({ shrunk, ...message }) => message),
+  ];
   const options = withTools ? { tools } : {};
   const deadline = Date.now() + remainingMs;
 
@@ -222,6 +229,44 @@ async function askModel(session, remainingMs, withTools) {
       if (wait > left - RETRY_FLOOR_MS) throw err;
       await sleep(wait);
     }
+  }
+}
+
+/** Tool results this recent stay whole; older ones are shrunk. */
+const TOOL_RESULTS_KEPT_WHOLE = 6;
+/** How much of an old tool result to keep. Enough to stay recognisable. */
+const SHRUNK_TO = 220;
+
+/**
+ * Shrink old tool results in place.
+ *
+ * The team shares 150,000 tokens per five minutes, the system prompt is ~4k
+ * tokens and goes out every round, and a search result is large. A long
+ * conversation therefore walks into `token_quota_exceeded` partway through
+ * judging — which looks exactly like a broken agent.
+ *
+ * Deleting messages is not an option: an assistant message carrying `tool_calls`
+ * must be followed by one tool message per call, so removing either half makes
+ * every later request invalid. Shrinking the *content* keeps the pairing intact
+ * and costs nothing real — the facts the loop needs live in session.state, not in
+ * the transcript, and the model has already read these results once.
+ *
+ * Raised by the behaviour half (HANDOFF_TO_LOOP.md, item 6).
+ */
+function compressOldToolResults(session) {
+  const tools = [];
+  for (let i = 0; i < session.messages.length; i += 1) {
+    if (session.messages[i].role === 'tool') tools.push(i);
+  }
+
+  for (const i of tools.slice(0, Math.max(0, tools.length - TOOL_RESULTS_KEPT_WHOLE))) {
+    const message = session.messages[i];
+    if (message.shrunk) continue;
+    const content = message.content ?? '';
+    if (content.length > SHRUNK_TO) {
+      message.content = `${content.slice(0, SHRUNK_TO)}... (older result, shortened to save space; call the tool again if you need the rest)`;
+    }
+    message.shrunk = true;
   }
 }
 
@@ -549,6 +594,64 @@ function stableJson(value) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** How many listings to enrich for their map link. The cards are capped anyway. */
+const MAP_LINK_LOOKUPS = 3;
+
+/**
+ * Make the cards clickable.
+ *
+ * A search hit is compact and carries no `mapUrl` — only `get_listing` returns
+ * one (docs/sandbox.md) — so cards built straight from a search have nothing to
+ * link to. `cardFor` in parts.js sets `card.url` when the listing has a `mapUrl`,
+ * so fetching the detail for the few listings we are about to show is enough to
+ * turn a dead card into one that opens the venue's location.
+ *
+ * Reads only, in parallel, capped at three, and skipped entirely when the turn is
+ * short of time: a clickable card is a nice-to-have and an answer is not.
+ */
+async function addMapLinks(session, turn, text) {
+  if (turn.deadline - Date.now() < RETRY_FLOOR_MS) return;
+
+  // The listings the model chose to card come first. It rarely cards the first
+  // three hits — it picks three out of eight and explains why — so enriching the
+  // head of the search is enriching the wrong ones.
+  const wanted = [];
+  for (const id of [...cardedIds(text, session.state), ...turn.lookedUpIds]) {
+    const listing = session.state.seen?.[id];
+    if (!listing || listing.mapUrl || wanted.includes(id)) continue;
+    wanted.push(id);
+    if (wanted.length >= MAP_LINK_LOOKUPS) break;
+  }
+  if (wanted.length === 0) return;
+
+  const details = await Promise.all(wanted.map((id) => callTool('get_listing', { id })));
+  for (const detail of details) {
+    if (detail?.id && !detail.error) stash(session.state, detail);
+  }
+}
+
+/**
+ * The ids on the model's `CARDS:` line, resolved against what tools returned.
+ *
+ * That tag line is the behaviour half's protocol (agent/prompt.js and
+ * agent/parts.js). This only reads it, to know which listings are about to
+ * become cards. It matches names as well as ids because the model sometimes
+ * writes the name, and parts.js resolves it the same way.
+ */
+function cardedIds(text, state) {
+  const found = [];
+  for (const match of String(text ?? '').matchAll(/^[\s*_`]*CARDS[*_`]*\s*:(.*)$/gim)) {
+    for (const piece of match[1].split(',')) {
+      const key = piece.replace(/[*`"'[\]]/g, '').trim();
+      if (!key) continue;
+      const listing = state.seen?.[key]
+        ?? Object.values(state.seen ?? {}).find((l) => l?.name?.toLowerCase() === key.toLowerCase());
+      if (listing?.id && !found.includes(listing.id)) found.push(listing.id);
+    }
+  }
+  return found;
 }
 
 /** Keep the trace short enough that a session cannot grow without bound. */
