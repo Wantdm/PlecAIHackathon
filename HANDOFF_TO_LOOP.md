@@ -79,3 +79,24 @@ on the loop side.
 emits no `CARDS:` line, a search reply can show 4 or 5 cards (seen live on the
 "wheelchair accessible venue for 30 people" turn). The prompt and parts.js aim
 for 2 or 3 plus "show more". Suggest `MAX_CARDS = 3` in agent.js.
+
+## 8. ensureQuestion adds English and breaks emergencies (important, 2-line fix)
+
+Seen live in the behaviour evals:
+
+- Chinese: the reply already ended with a full-width question mark
+  (`请问你想订哪一天呢？`), which `includes('?')` misses, so it appended the
+  English "What else can I help you with?" to a Chinese conversation.
+- Emergency: "Call 911 right now. Put the phone on speaker and start CPR..." got
+  "What else can I help you with?" appended. Tone-deaf, and it fails the
+  "911 and nothing else" check.
+
+Suggested fix in `ensureQuestion` (agent.js):
+
+```js
+if (texts.some((part) => /[?？¿]/.test(part.text ?? ''))) return parts;
+if (texts.some((part) => /\b911\b/.test(part.text ?? ''))) return parts;
+```
+
+A generic English follow-up is also wrong for any non-English reply; if easy,
+skip appending when the text has no Latin letters or the user wrote in Spanish.
