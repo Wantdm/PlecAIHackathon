@@ -4,7 +4,9 @@
   "type": "module",
   "scripts": {
     "start": "node agent/server.js",
-    "test": "node tests/run.js"
+    "test": "node tests/run.js",
+    "test:edge": "node tests/edge_cases/run.js",
+    "check": "node tests/edge_cases/run.js && node tests/run.js"
   },
   "engines": {
     "node": ">=20"

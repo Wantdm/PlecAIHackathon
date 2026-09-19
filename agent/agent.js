@@ -42,6 +42,39 @@ const MAX_CARDS = 5;
 const WRITE_TOOLS = new Set(['book', 'cancel_booking', 'reschedule_booking']);
 
 /**
+ * Retry policy for reads.
+ *
+ * The model proxy and the sandbox are shared across every team and capped per
+ * five-minute window, so a 429 is a fact of the afternoon rather than a bug. A
+ * read is safe to repeat, so repeat it — with jitter, because every team's agent
+ * hits the same cap at the same moment and a fixed backoff makes them collide
+ * again on the retry.
+ */
+const READ_RETRIES = 2;
+const BACKOFF_BASE_MS = 400;
+const BACKOFF_MAX_MS = 2_500;
+/** Below this, a retry cannot finish and would only eat the final answer's time. */
+const RETRY_FLOOR_MS = 6_000;
+
+/** Codes worth trying again: the request never landed, or the far side was busy. */
+const TRANSIENT = new Set(['network', 'rate_limited', 'too_many_requests', 'upstream_error', 'server_error']);
+
+/**
+ * A write whose outcome we do not know. Retrying is the one thing we must never
+ * do here: a repeated `book` that actually succeeded the first time bills the
+ * guest twice, and the guest cannot undo that. Reconcile instead.
+ */
+function isAmbiguous(result) {
+  if (!result?.error) return false;
+  return result.error === 'network' || (result.status ?? 0) >= 500;
+}
+
+function isTransient(result) {
+  if (!result?.error) return false;
+  return TRANSIENT.has(result.error) || (result.status ?? 0) === 429 || (result.status ?? 0) >= 500;
+}
+
+/**
  * A yes, in the message that triggered the write. Deliberately narrow: "book
  * it" and "cancel BK-1001" are requests, not confirmations, and the suite
  * checks that neither one acts on its own. Spanish is here because a Spanish
@@ -89,7 +122,10 @@ async function runTurn({ text, session, deadline }) {
   // What happened during this turn only, as opposed to session.state, which is
   // the whole conversation. The card fallback needs "what did we look up just
   // now", so a card is never a leftover from three turns ago.
-  const turn = { text, lookedUpIds: [] };
+  // `calls` is this turn's tool fingerprints, which is how a stuck model gets
+  // told it is repeating itself. `deadline` rides along so a retry can decide
+  // whether there is still room for one.
+  const turn = { text, lookedUpIds: [], calls: new Map(), deadline };
 
   for (let round = 0; round < MAX_ROUNDS; round += 1) {
     const remaining = deadline - Date.now();
@@ -109,7 +145,12 @@ async function runTurn({ text, session, deadline }) {
     // message per call in the same order, or the next request is rejected.
     session.messages.push(forHistory(reply.message));
 
+    // Independent calls go together. "Check these five venues for Friday" is one
+    // round-trip, not five, which is the difference between a four-second answer
+    // and a timeout.
     const settled = await Promise.all(reply.toolCalls.map((call) => runToolCall(call, session, turn)));
+    await unwindPartialBundle(settled, session, turn);
+
     for (const { call, result } of settled) {
       session.messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(result) });
     }
@@ -131,7 +172,21 @@ async function runTurn({ text, session, deadline }) {
 async function askModel(session, remainingMs, withTools) {
   const messages = [{ role: 'system', content: systemPrompt(session) }, ...session.messages];
   const options = withTools ? { tools } : {};
-  return await withTimeout(chatCompletion(messages, options), remainingMs);
+  const deadline = Date.now() + remainingMs;
+
+  // The proxy is shared and capped per five-minute window, so a 429 here is the
+  // cap rather than our bug. Sit out one short wait before giving up: the turn
+  // is worth more than the second we spend waiting.
+  for (let attempt = 0; ; attempt += 1) {
+    const left = deadline - Date.now();
+    try {
+      return await withTimeout(chatCompletion(messages, options), left);
+    } catch (err) {
+      const busy = /\b(429|rate|too many)\b/i.test(err?.message ?? '') || err?.status === 429;
+      if (!busy || attempt >= 1 || left < RETRY_FLOOR_MS * 2) throw err;
+      await sleep(BACKOFF_BASE_MS + Math.random() * BACKOFF_MAX_MS);
+    }
+  }
 }
 
 /**
@@ -143,19 +198,332 @@ async function askModel(session, remainingMs, withTools) {
  */
 async function runToolCall(call, session, turn) {
   const args = parseToolArguments(call.argumentsJson);
+  const isWrite = WRITE_TOOLS.has(call.name);
 
-  if (WRITE_TOOLS.has(call.name) && !AFFIRMATIVE.test(turn.text)) {
+  if (isWrite && !AFFIRMATIVE.test(turn.text)) {
     session.state.pending = { kind: call.name, args };
     return { call, result: { error: 'confirmation_required', message: NEEDS_CONFIRMATION[call.name] } };
   }
 
-  const result = await callTool(call.name, args);
+  // A model that calls the same tool with the same arguments twice in one turn
+  // is stuck, not thorough. Hand back what it already has so it spends the next
+  // round writing an answer instead of burning the budget re-asking.
+  const fingerprint = `${call.name}:${stableJson(args)}`;
+  if (turn.calls.has(fingerprint)) {
+    return {
+      call,
+      result: {
+        error: 'already_called',
+        message: 'You already called this exact tool with these exact arguments this turn. The result is above. Answer the user now, or call a different tool.',
+        previous: turn.calls.get(fingerprint),
+      },
+    };
+  }
+
+  // Claim the fingerprint before awaiting anything. The calls in one round run
+  // together under Promise.all, so a check that only records the result would
+  // let both halves of a duplicated call through: neither has finished by the
+  // time the other starts.
+  turn.calls.set(fingerprint, null);
+
+  const startedAt = Date.now();
+  const result = isWrite
+    ? await runWrite(call.name, args, session, turn)
+    : await runRead(call.name, args, turn);
+
+  turn.calls.set(fingerprint, result);
+  trace(session, call.name, args, result, startedAt);
   remember(session, call.name, args, result, turn);
 
   // The action happened, so there is nothing outstanding to confirm.
-  if (WRITE_TOOLS.has(call.name) && !result?.error) delete session.state.pending;
+  if (isWrite && !result?.error) delete session.state.pending;
 
   return { call, result };
+}
+
+/** Reads are safe to repeat, so a busy sandbox costs us a wait, not the turn. */
+async function runRead(name, args, turn) {
+  let result = await callTool(name, args);
+
+  for (let attempt = 1; attempt <= READ_RETRIES && isTransient(result); attempt += 1) {
+    if (turn.deadline - Date.now() < RETRY_FLOOR_MS) break;
+
+    const wait = Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * 2 ** (attempt - 1));
+    await sleep(Math.round(wait / 2 + Math.random() * wait));
+    result = await callTool(name, args);
+  }
+
+  if (name === 'search_listings' && Array.isArray(result?.results) && result.results.length === 0) {
+    return await relaxSearch(args, result, turn);
+  }
+  return result;
+}
+
+/**
+ * Nothing matched. Widen one constraint and say which one.
+ *
+ * "No venues found" is a dead end for the user: they cannot tell whether the
+ * city was wrong, the date was blacked out or the party was too big. So drop one
+ * filter at a time, loosest first, and hand the model the name of what was
+ * dropped so the reply can say "nothing on October 10, but here are three that
+ * fit on other dates".
+ *
+ * One constraint at a time, and never the headcount before the date: a venue the
+ * group does not fit in is not a result, it is a wrong answer.
+ */
+const RELAXATION_LADDER = [
+  { drop: 'q', says: 'the name you searched for' },
+  { drop: 'category', says: 'the category' },
+  { drop: 'date', says: 'the date' },
+  { drop: 'capacityMin', says: 'the minimum capacity' },
+  { drop: 'guests', says: 'the headcount' },
+];
+
+async function relaxSearch(args, empty, turn) {
+  const tried = [];
+  let current = { ...args };
+
+  for (const step of RELAXATION_LADDER) {
+    if (current[step.drop] === undefined || current[step.drop] === null) continue;
+    if (turn.deadline - Date.now() < RETRY_FLOOR_MS) break;
+
+    const dropped = current[step.drop];
+    delete current[step.drop];
+    tried.push(step.drop);
+
+    const wider = await callTool('search_listings', current);
+    if (Array.isArray(wider?.results) && wider.results.length > 0) {
+      return {
+        ...wider,
+        relaxed: { constraint: step.drop, originalValue: dropped, stillApplied: current },
+        note: `Nothing matched the original search. These results come from the same search with ${step.says} relaxed (${step.drop} was ${JSON.stringify(dropped)}). Tell the user you widened that one thing, and say what it was, before listing anything.`,
+      };
+    }
+  }
+
+  return {
+    ...empty,
+    relaxed: { constraint: null, attempted: tried },
+    note: tried.length
+      ? `Nothing matched even after relaxing ${tried.join(', then ')}. Tell the user plainly that nothing fits and ask which detail they can change.`
+      : 'Nothing matched. Ask the user which detail they can change.',
+  };
+}
+
+/**
+ * One attempt, then verify. Never a retry.
+ *
+ * Three guards, in the order they matter:
+ *
+ *   1. Idempotency. The same booking asked for twice in one conversation — a
+ *      double-sent message, a model that re-books after being told the first
+ *      one worked — returns the first booking rather than making a second.
+ *   2. Reconciliation. When the call fails in a way that leaves the outcome
+ *      unknown (the socket died, the sandbox 500ed), we do not guess and we do
+ *      not retry. We list the bookings and look.
+ *   3. Verification. On apparent success, re-read the booking. A reply that
+ *      says "booked" is only worth saying if the sandbox agrees.
+ */
+async function runWrite(name, args, session, turn) {
+  const state = session.state;
+  state.writes ??= {};
+
+  const key = name === 'book' ? bookingKey(args, state) : null;
+  if (key && state.writes[key]) {
+    const done = state.writes[key];
+    return { ...done, idempotent: true, note: `This booking already exists as ${done.ref}. It was not booked again.` };
+  }
+
+  const result = await callTool(name, args);
+
+  if (isAmbiguous(result)) {
+    const found = await reconcile(name, args, state, turn);
+    if (found) return { ...found, reconciled: true, note: 'The request timed out but the booking did go through. This is the real record; do not try again.' };
+    return {
+      ...result,
+      message: `${result.message} Nothing was changed, as far as I can tell. Tell the user it did not go through and ask whether to try again.`,
+    };
+  }
+
+  if (result?.error) return result;
+
+  if (key && result.ref) state.writes[key] = result;
+
+  const confirmed = await verify(result.ref, turn);
+  return confirmed ? { ...result, ...confirmed } : result;
+}
+
+/**
+ * Did the write land after all? Looks for a booking matching what we asked for.
+ * Only a read, so it is safe to make after a failure of unknown outcome.
+ */
+async function reconcile(name, args, state, turn) {
+  if (turn.deadline - Date.now() < RETRY_FLOOR_MS) return null;
+
+  if (name === 'book') {
+    const listing = await runRead('list_bookings', {}, turn);
+    const rows = Array.isArray(listing?.bookings) ? listing.bookings : (listing?.results ?? []);
+    const known = new Set(Object.keys(state.bookings ?? {}));
+    return (
+      rows.find(
+        (row) =>
+          !known.has(row.ref) &&
+          row.status !== 'cancelled' &&
+          (!args.listingId || row.listingId === args.listingId) &&
+          (!args.date || row.date === args.date),
+      ) ?? null
+    );
+  }
+
+  // cancel and reschedule both name the booking, so read that one row back.
+  if (!args.ref) return null;
+  const row = await runRead('get_booking', { ref: args.ref }, turn);
+  if (row?.error) return null;
+  if (name === 'cancel_booking' && row.status === 'cancelled') return row;
+  if (name === 'reschedule_booking' && args.date && row.date === args.date) return row;
+  return null;
+}
+
+/**
+ * A bundle is all or nothing.
+ *
+ * When a round books several things together — the venue, the caterer, the
+ * photographer — a partial success is the worst outcome available. The user asked
+ * for an evening, and half an evening still costs them money and still has to be
+ * unpicked by hand. So if any booking in the round failed, cancel the ones that
+ * went through and tell the model what it is now holding.
+ *
+ * Only bookings made in this same round are unwound. An earlier booking from an
+ * earlier turn is a commitment the user already agreed to, and cancelling it
+ * because a later unrelated one failed would be its own disaster.
+ */
+async function unwindPartialBundle(settled, session, turn) {
+  const books = settled.filter((s) => s.call.name === 'book');
+  if (books.length < 2) return;
+
+  const made = books.filter((s) => s.result?.ref && !s.result.error && s.result.status !== 'cancelled');
+  const failed = books.filter((s) => s.result?.error);
+  if (failed.length === 0 || made.length === 0) return;
+
+  const undone = [];
+  const stuck = [];
+  for (const { result } of made) {
+    const out = await callTool('cancel_booking', { ref: result.ref });
+    if (out?.error) stuck.push(result.ref);
+    else {
+      undone.push(result.ref);
+      session.state.bookings[result.ref] = out;
+      // The idempotency record must go too, or a genuine retry of the whole
+      // bundle would be told the cancelled booking already exists.
+      for (const [key, saved] of Object.entries(session.state.writes ?? {})) {
+        if (saved?.ref === result.ref) delete session.state.writes[key];
+      }
+    }
+  }
+
+  const detail = [
+    `Part of this bundle failed, so it was rolled back: nothing in it stands.`,
+    undone.length ? `Cancelled again: ${undone.join(', ')}.` : '',
+    stuck.length ? `Could NOT cancel ${stuck.join(', ')} — tell the user this one is still live and needs attention.` : '',
+    `Tell the user which part failed and why, say the rest was undone, and ask whether to try a different option.`,
+  ]
+    .filter(Boolean)
+    .join(' ');
+
+  for (const entry of made) {
+    entry.result = { ...entry.result, rolledBack: true, status: 'cancelled', note: detail };
+  }
+  for (const entry of failed) {
+    entry.result = { ...entry.result, bundleRolledBack: true, note: detail };
+  }
+  turn.rolledBack = [...undone, ...stuck];
+}
+
+/** Re-read a booking we just wrote, so what we tell the user is the sandbox's word. */
+async function verify(ref, turn) {
+  if (!ref || turn.deadline - Date.now() < RETRY_FLOOR_MS) return null;
+  const row = await runRead('get_booking', { ref }, turn);
+  return row?.error ? null : row;
+}
+
+/**
+ * What makes two booking requests the same booking: the listing, the slot, the
+ * size and who it is for. Not the quoteId — a fresh quote for the identical slot
+ * is still the same booking.
+ */
+function bookingKey(args, state) {
+  if (!args.listingId && !state.lastQuote?.listingId) return null;
+  const parts = [
+    args.listingId ?? state.lastQuote?.listingId,
+    args.date ?? state.date,
+    args.startTime ?? '',
+    args.endTime ?? '',
+    args.guests ?? args.guestCount ?? state.guestCount ?? '',
+    (args.guestEmail ?? state.guest?.email ?? '').toLowerCase(),
+  ];
+  return parts.join('|');
+}
+
+/** Key order must not change a fingerprint, so sort before stringifying. */
+function stableJson(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  const keys = Object.keys(value).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableJson(value[k])}`).join(',')}}`;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Keep the trace short enough that a session cannot grow without bound. */
+const TRACE_LIMIT = 60;
+
+/**
+ * Every tool call, with what it was asked and what came back.
+ *
+ * This is the data behind a live trace panel: a reader can see that a price came
+ * from a `quote` and not from the model's imagination, which is the single
+ * clearest way to show the agent is not making things up. Kept on the session so
+ * a UI can read it without the loop knowing a UI exists.
+ */
+function trace(session, name, args, result, startedAt) {
+  const state = session.state;
+  state.trace ??= [];
+  state.trace.push({
+    at: new Date(startedAt).toISOString(),
+    ms: Date.now() - startedAt,
+    tool: name,
+    args,
+    ok: !result?.error,
+    outcome: result?.error
+      ? { error: result.error, message: result.message }
+      : summarise(name, result),
+  });
+  if (state.trace.length > TRACE_LIMIT) state.trace.splice(0, state.trace.length - TRACE_LIMIT);
+}
+
+/** A line a human can read at a glance, not the whole payload. */
+function summarise(name, result) {
+  if (!result || typeof result !== 'object') return { value: result };
+  if (Array.isArray(result.results)) {
+    return { matched: result.results.length, names: result.results.slice(0, 5).map((r) => r?.name).filter(Boolean), relaxed: result.relaxed?.constraint ?? null };
+  }
+  if (Array.isArray(result.bookings)) return { bookings: result.bookings.length };
+  if (result.totalCents !== undefined && !result.ref) return { totalCents: result.totalCents };
+  if (result.ref) {
+    return {
+      ref: result.ref,
+      status: result.status,
+      totalCents: result.totalCents,
+      payment: result.payment?.status ?? null,
+      idempotent: result.idempotent ?? undefined,
+      reconciled: result.reconciled ?? undefined,
+      rolledBack: result.rolledBack ?? undefined,
+    };
+  }
+  if (result.name) return { listing: result.name, capacity: result.capacity ?? null };
+  return { keys: Object.keys(result).slice(0, 8) };
 }
 
 /**
