@@ -75,6 +75,15 @@ const cases = [
   }],
   ['Prompt restates reservations made this conversation', () =>
     systemPrompt({ state: { bookings: { 'BK-1001': { ref: 'BK-1001', listingName: 'The Foundry at Fishtown', date: '2026-10-10', startTime: '18:00', endTime: '23:00', guestCount: 40, status: 'pending_payment' } } } }).includes('BK-1001: The Foundry at Fishtown')],
+  ['Invented street address is removed with its sentence', () => {
+    const t = textOf(toParts("No phone number. The address is 1101 Frankford Avenue, Philadelphia, PA 19125. Want a note?", session));
+    return t === "No phone number. I don't have the street address in front of me, but I can look it up if you'd like. Want a note?";
+  }],
+  ['Real street address from a seen listing is kept', () => {
+    const s = { state: { seen: { f: { ...seen['foundry-fishtown'], address: '1400 N Front St, Philadelphia, PA 19122' } } } };
+    const text = 'It is at 1400 N Front St, Philadelphia, PA 19122. Want a note?';
+    return textOf(toParts(text, s)) === text;
+  }],
   ['Prompt calendar has the right weekday for October 10, 2026', () => systemPrompt({ state: {} }).includes('10-10 Sat')],
 ];
 
