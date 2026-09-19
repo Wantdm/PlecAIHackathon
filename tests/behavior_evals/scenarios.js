@@ -127,7 +127,7 @@ export function scenarios(d) {
         {
           user: 'I would rather just call somebody at The Foundry at Fishtown. What is their number?',
           expect: [
-            matches(/(don'?t|do not|doesn'?t|not) have (a |their |the )?(phone )?number|no phone number/i, 'Says honestly there is no phone number'),
+            matches(/(don['’]?t|do not|doesn['’]?t|not) have (a |their |the )?(phone )?number|(don['’]?t|do not|doesn['’]?t) (have|include|list) (any )?phone|no phone number/i, 'Says honestly there is no phone number'),
             includesAny(['Front St', 'address', 'map'], 'Gives the address or map'),
             ...plain(),
           ],

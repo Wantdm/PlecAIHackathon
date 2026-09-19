@@ -31,7 +31,7 @@ export function toParts(text, session) {
   const photoIds = idsFrom(raw, 'PHOTOS');
   const mapIds = idsFrom(raw, 'MAP');
   const bookingRefs = idsFrom(raw, 'BOOKING');
-  const clean = plainText(raw.replace(TAG_LINE, ''));
+  const clean = dropInventedAddresses(plainText(raw.replace(TAG_LINE, '')), seen);
 
   // The contract requires at least one text part on every turn.
   const parts = [{ kind: 'text', text: clean || 'Sorry, could you say that again?' }];
@@ -122,6 +122,38 @@ export function plainText(text) {
     .replace(/\b\d(?:[ -]?\d){12,18}\b/g, '[removed]');
 
   return out.replace(/\u0000(\d+)\u0000/g, (_, i) => urls[Number(i)]);
+}
+
+/**
+ * A street address in the reply must be one a tool returned. Search hits carry
+ * no address, and when the model has none it writes a plausible fake one
+ * ("1101 Frankford Avenue") with total confidence. A match is the street number
+ * plus the first word of the street name found in some seen listing's address.
+ * An unmatched address takes its whole sentence with it.
+ */
+const STREET = /\b\d{1,5}\s+(?:(?:N|S|E|W|North|South|East|West)\.?\s+)?([A-Z0-9][\w'-]*)(?:\s+[A-Z][\w'-]*){0,2}\s+(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Boulevard|Dr|Drive|Ln|Lane|Way|Pl|Place|Pike|Ct|Court|Pkwy|Parkway|Sq|Square|Row|Terrace)\b/g;
+const NO_ADDRESS = "I don't have the street address in front of me, but I can look it up if you'd like.";
+
+export function dropInventedAddresses(text, seen) {
+  const known = Object.values(seen ?? {}).map((l) => String(l?.address ?? '').toLowerCase()).filter(Boolean);
+  const isKnown = (match, word) => {
+    const num = match.match(/\d+/)[0];
+    return known.some((a) => new RegExp(`\\b${num}\\b`).test(a) && a.includes(word.toLowerCase()));
+  };
+
+  let out = text;
+  for (const m of [...text.matchAll(STREET)]) {
+    if (isKnown(m[0], m[1])) continue;
+    const at = out.indexOf(m[0]);
+    if (at < 0) continue;
+    const before = out.slice(0, at);
+    const start = Math.max(before.search(/(?<=^|[.!?\n]\s*)[^.!?\n\s][^.!?\n]*$/), 0);
+    const rest = out.slice(at);
+    const endRel = rest.search(/[.!?](\s|$)|\n/);
+    const end = endRel < 0 ? out.length : at + endRel + (rest[endRel] === '\n' ? 0 : 1);
+    out = `${out.slice(0, start)}${NO_ADDRESS}${out.slice(end)}`;
+  }
+  return out;
 }
 
 /** By id, or by exact name in case the model wrote the name. Always a real listing object. */
