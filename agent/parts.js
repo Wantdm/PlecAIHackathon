@@ -9,8 +9,14 @@
  * Building cards from the model's prose is how invented venues reach the judges.
  */
 
-/** Tag lines the model appends to ask for rich parts; stripped before display. */
-const TAG_LINE = /^(CARDS|PHOTOS):.*$/gm;
+/**
+ * Tag lines the model appends to ask for rich parts; stripped before display.
+ * Tolerates the model wrapping the tag in markdown (`**CARDS:** a, b`).
+ */
+const TAG_LINE = /^[\s*_`]*(CARDS|PHOTOS|MAP)[*_`]*\s*:.*$/gim;
+
+/** More cards than this is a brochure, not an answer. */
+const MAX_CARDS = 8;
 
 /**
  * @param {string} text  the model's final answer
@@ -21,27 +27,100 @@ export function toParts(text, session) {
   const seen = session?.state?.seen ?? {};
   const raw = typeof text === 'string' ? text : '';
 
-  const cardIds = idsFrom(raw, 'CARDS');
+  const cardIds = idsFrom(raw, 'CARDS').slice(0, MAX_CARDS);
   const photoIds = idsFrom(raw, 'PHOTOS');
-  const clean = raw.replace(TAG_LINE, '').trim();
+  const mapIds = idsFrom(raw, 'MAP');
+  const clean = plainText(raw.replace(TAG_LINE, ''));
 
   // The contract requires at least one text part on every turn.
   const parts = [{ kind: 'text', text: clean || 'Sorry, could you say that again?' }];
 
+  const carded = new Set();
   for (const id of cardIds) {
-    const listing = seen[id];
-    if (listing) parts.push(cardFor(listing));
+    const listing = lookup(seen, id);
+    if (!listing || carded.has(listing)) continue;
+    carded.add(listing);
+    parts.push(cardFor(listing));
   }
 
   for (const id of photoIds) {
-    const listing = seen[id];
-    for (const url of listing?.photoUrls ?? []) {
-      parts.push({ kind: 'image', url, caption: listing.name });
+    const listing = lookup(seen, id);
+    if (!listing) continue;
+    const urls = listing.photoUrls ?? [];
+    for (const url of urls) parts.push({ kind: 'image', url, caption: listing.name });
+    // No photos on file: a card is the next best photo-capable part.
+    if (urls.length === 0 && !carded.has(listing)) {
+      carded.add(listing);
+      parts.push(cardFor(listing));
     }
   }
 
-  // TODO(behaviour): link parts to mapUrl when the user asks where something is.
+  for (const id of mapIds) {
+    const listing = lookup(seen, id);
+    if (listing?.mapUrl) parts.push({ kind: 'link', label: `${listing.name} on the map`, url: listing.mapUrl });
+  }
+
   return parts;
+}
+
+/**
+ * The chat page draws text parts with textContent (chat/index.html) and the
+ * contract says no markdown rendering, so any markdown the model writes shows
+ * up as stray symbols. The prompt asks for plain sentences; this is the net.
+ *
+ * URLs are set aside first and restored last, so a payment link like
+ * .../pay/cs_test_ab_cd survives byte for byte. Money, times and BK- refs carry
+ * no markdown characters and pass through untouched.
+ */
+export function plainText(text) {
+  const urls = [];
+  const keep = (url) => `\u0000${urls.push(url) - 1}\u0000`;
+
+  let out = text
+    // [label](url) -> label: url
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (_, label, url) => `${label}: ${keep(url)}`)
+    .replace(/https?:\/\/[^\s<>"')\]]*[^\s<>"')\].,;:!?]/g, keep);
+
+  const isSeparator = (line) => /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(line);
+  const lines = out.split('\n');
+  out = lines
+    // A table's header row (the line above |---|) and the separator itself carry no facts.
+    .filter((line, i) => !isSeparator(line) && !(isSeparator(lines[i + 1] ?? '') && line.includes('|')))
+    .map((line) => {
+      if (/^\s*\|.*\|\s*$/.test(line)) {
+        const cells = line.trim().slice(1, -1).split('|').map((c) => c.trim()).filter(Boolean);
+        line = cells.length === 2 ? `${cells[0]}: ${cells[1]}` : cells.join(', ');
+      }
+      return line
+        .replace(/^\s{0,3}#{1,6}\s+/, '')
+        .replace(/^\s*>\s?/, '')
+        .replace(/^\s*[-*+•]\s+/, '');
+    })
+    .join('\n');
+
+  out = out
+    .replace(/\*\*(.+?)\*\*/g, '$1')
+    .replace(/__(.+?)__/g, '$1')
+    .replace(/(^|[^\w*])\*(?!\s)([^*\n]+?)\*(?!\w)/g, '$1$2')
+    .replace(/(^|[^\w])_(?!\s)([^_\n]+?)_(?!\w)/g, '$1$2')
+    .replace(/~~(.+?)~~/g, '$1')
+    .replace(/`([^`\n]*)`/g, '$1')
+    .replace(/[*`]/g, '')
+    .replace(/[\p{Extended_Pictographic}\u{1F1E6}-\u{1F1FF}\uFE0F\u200D]/gu, '')
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/[ \t]+$/gm, '')
+    .replace(/^[ \t]+/gm, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
+  return out.replace(/\u0000(\d+)\u0000/g, (_, i) => urls[Number(i)]);
+}
+
+/** By id, or by exact name in case the model wrote the name. Always a real listing object. */
+function lookup(seen, key) {
+  if (seen[key]) return seen[key];
+  const k = key.toLowerCase();
+  return Object.values(seen).find((l) => l?.id?.toLowerCase() === k || l?.name?.toLowerCase() === k) ?? null;
 }
 
 /**
@@ -86,10 +165,13 @@ export function dollars(cents) {
 }
 
 function idsFrom(text, tag) {
-  const match = text.match(new RegExp(`^${tag}:\\s*(.+)$`, 'm'));
-  if (!match) return [];
-  return match[1]
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
+  const ids = [];
+  const re = new RegExp(`^[\\s*_\`]*${tag}[*_\`]*\\s*:(.*)$`, 'gim');
+  for (const match of text.matchAll(re)) {
+    for (const piece of match[1].split(',')) {
+      const id = piece.replace(/[*`"'[\]]/g, '').trim();
+      if (id && !ids.includes(id)) ids.push(id);
+    }
+  }
+  return ids;
 }
