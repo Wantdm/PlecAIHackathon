@@ -66,11 +66,3 @@ With the 150k-token / 5-minute team cap, long conversations (history grows
 too) can hit `token_quota_exceeded` during judging. If that shows up, trimming
 old tool results from `session.messages` (keep the last few) is the cheapest fix
 on the loop side.
-
-## 7. Housekeeping
-
-- `CLAUDE.md` still says "`.env` is gitignored, so this setting does not travel
-  through git", but `.env` is now tracked on `loop`. Worth one line fixing.
-- `git fetch` from `github.com/Wantdm/PlecAIHackathon` returned "Repository not
-  found" at the time of writing. Check the repo was not renamed or made
-  inaccessible before the 3:30pm submission.
