@@ -1,0 +1,212 @@
+PLEC CONCIERGE — FEATURE LIST
+Team: Claude and Co. (Stanley Yang, Bryan Chen)
+Repo: https://github.com/Wantdm/PlecAIHackathon
+
+
+TEST RESULTS
+
+  Public evaluator suite (live PLEC sandbox)     7 / 7
+  Edge-case suite (mocked sandbox and model)    23 / 23
+  Behaviour eval suite (offline)                30 / 30
+
+  Run them with:  npm test  |  npm run test:edge  |  node tests/behavior_evals/run.js
+
+
+HOW IT IS BUILT
+
+The agent is an OpenAI-compatible tool-calling loop over the PLEC sandbox. The
+model decides which tool it needs, the loop runs it, feeds the result back, and
+repeats until the model answers in words.
+
+The codebase is split by file ownership so two people could build it in parallel
+without merge collisions:
+
+  loop half      agent/agent.js, agent/session.js     the turn loop and memory
+  behaviour half agent/prompt.js, agent/parts.js      the system prompt and rendering
+
+Four function signatures were frozen up front as the seam between the halves.
+Three merges across the afternoon, all conflict-free, neither half ever editing
+the other's files.
+
+
+1. CORRECTNESS AND SAFETY
+
+Confirm before acting, enforced in code
+  Booking, cancelling and rescheduling only run when the user's current message
+  contains a clear yes. A prompt is advice; this is a gate. "book it" and
+  "cancel BK-1001" are requests, not consent, and neither acts on its own.
+
+Hedged yeses are refused
+  "yes I think so", "ok, is that the one near the river?" and "sure, but make it
+  7pm" all contain an affirmative and none of them is permission to spend
+  someone's money. A question mark or a "but" means the user has not decided, or
+  is changing the terms that were quoted. The model is told the yes was unclear,
+  so it answers what was actually asked instead of repeating itself.
+
+Every fact comes from a tool
+  Capacity, price, hours, availability and booking status are only ever stated
+  from a tool result in the same conversation. Prices are the sandbox's own
+  all-in total from a quote, never computed.
+
+Cards can only be real venues
+  A card is built only from a listing object a tool actually returned, and its
+  title is the listing's exact name. Building cards from the model's prose is
+  how invented venues reach a user.
+
+Own reservations only
+  "What did I book?" used to return every booking the whole team had made, which
+  means showing a stranger's reservation to whoever asked. It now filters by the
+  guest on file, and asks for an email when there is none.
+
+Payment honesty
+  A booking stays unpaid until the guest pays the checkout link. The agent never
+  claims payment happened and never tries to pay on their behalf.
+
+Host text is data, not instructions
+  One listing description in the sandbox tries to give the agent orders. It is
+  treated as data and ignored, including the promo code it plants.
+
+
+2. RELIABILITY
+
+Always answers
+  The loop carries a 32-second wall-clock budget, inside the server's 40-second
+  cut. With under 12 seconds left it stops reaching for tools and spends what is
+  left writing prose, because an unanswered turn scores zero on every check.
+
+Retries with jittered backoff
+  Transient read failures are retried. The jitter matters: the sandbox and the
+  model proxy are shared across every team, so everyone hits the cap in the same
+  moment and a fixed backoff makes them collide again on the retry.
+
+Writes are never retried
+  A repeated booking that already succeeded bills the guest twice and they
+  cannot undo it. So a booking whose outcome is unknown is never repeated; the
+  loop reads the bookings back and finds out what really happened.
+
+Idempotent bookings
+  Keyed on listing, slot, party size and email. The same booking asked for twice
+  books once and reports the existing reference.
+
+Verify after write
+  Every booking is re-fetched and compared before the user is told it worked, so
+  "booked" is the sandbox's word rather than the model's.
+
+Loop detection
+  The same tool called with the same arguments twice in one turn is refused and
+  handed its own earlier result. A model doing that is stuck, not thorough.
+
+Honest rate limits
+  The shared proxy allows 40 requests and 150,000 tokens per five minutes across
+  the whole team. Hitting it now says "ask me again in about 29 seconds" instead
+  of "something went wrong", which would invite a retry straight into the same
+  wall.
+
+Token budget management
+  Old tool results are shrunk in place so a long conversation does not exhaust
+  the shared token budget partway through. Content is shortened rather than
+  messages removed, because every tool_calls message must keep its matching
+  results or all later requests in the session become invalid.
+
+Crash-safe history
+  A failed turn rolls back to a snapshot taken at its start, so a half-written
+  turn can never corrupt the next request.
+
+
+3. CAPABILITY
+
+Parallel fan-out
+  "Compare these five for Friday" fires the availability checks concurrently and
+  returns in about one round-trip. Measured with five in flight at once.
+
+Constraint relaxation
+  When a search returns nothing, the loop widens one constraint at a time and
+  reports which one it relaxed, instead of answering with a dead end. The ladder
+  is name, then category, then date, then capacity, then headcount. Headcount is
+  deliberately last: a venue the group does not fit in is not a result, it is a
+  wrong answer.
+
+Bundle booking with rollback
+  A venue, a caterer and a photographer booked together are one transaction. If
+  one fails, the ones that succeeded are cancelled back, because half an evening
+  still costs money and still has to be unpicked by hand. Only bookings from the
+  same round are unwound, and if a rollback cancel itself fails the agent says
+  that one is still live rather than pretending otherwise.
+
+Clickable venue cards
+  Search results carry no map link; only the detail endpoint does. The listings
+  the model chose to card are fetched in parallel before rendering, so each card
+  opens the venue's real address on a map. Concurrency makes this free: the turn
+  stayed at 3.7 seconds.
+
+Full booking lifecycle
+  Quote, book, check status, reschedule, cancel, and resend an expired payment
+  link. Verified end to end against the live sandbox.
+
+
+4. TRANSPARENCY
+
+Live tool trace
+  Every reply carries a collapsed line above it showing the tools that produced
+  it, with arguments, outcome and timing:
+
+    search_listings  city=Philadelphia guests=40 -> 1 match: The Foundry     45ms
+    quote            listingId=lst_foundry -> $1,815.00                      62ms
+    book             -> BK-9001, pending_payment, $1,815.00                  88ms
+
+  A reader can see that the price came from a quote rather than from the model's
+  imagination, which is the clearest way to show nothing was invented. The
+  contract response is untouched, so an evaluator that only reads it is
+  unaffected.
+
+
+5. CONVERSATION QUALITY
+
+  Plain sentences, no markdown or emoji, because the chat renders text exactly as
+  written and markdown arrives as stray symbols. A stripper backs up the prompt
+  and preserves payment URLs byte for byte.
+
+  Two to four sentences, then stop. Cards carry the detail.
+
+  Exactly one question per reply, and every reply that has not just finished an
+  action ends in a question.
+
+  Replies in the language the user wrote in, Spanish included, while tool
+  arguments stay in the form the sandbox expects.
+
+  Asks for what is missing once, then never again: city, date, headcount, name
+  and email are remembered for the whole conversation.
+
+  Accessibility and safety honesty: when a listing does not say whether it is
+  wheelchair accessible, the agent says the listing does not say and suggests
+  confirming with the venue, rather than guessing.
+
+  Cancellation policies explained from the listing's stated policy and fixed
+  refund rules, never a refund figure worked out by the model.
+
+  Two or three options with a real tradeoff each, drawn only from listing fields,
+  plus "say show more" rather than a wall of results.
+
+  No discounts or promo codes exist, and none is ever invented.
+
+  Out of scope requests are declined in one sentence that offers venue help
+  instead.
+
+
+6. TESTING
+
+Edge-case suite, 23 cases, mocked sandbox and mocked model
+  Free to run: it touches no network and, unlike the public suite, does not reset
+  the shared team booking state. It replaces the global fetch, so the real agent
+  runs against a fake internet and cases like a 500, a dead socket or an
+  exhausted rate limit can be tested on demand.
+
+  Two of those cases caught real bugs in code that looked correct:
+    - duplicate tool calls in one parallel round both slipped the dedupe,
+      because neither had finished by the time the other started
+    - constraint relaxation never fired at all, because the retry loop returned
+      early on any non-transient result and zero results is not transient
+
+Behaviour eval suite, 30 checks, offline
+  Covers an elderly user's full journey: a rambling story, an unsure yes, a clear
+  yes, a repeated request, and a recap.
