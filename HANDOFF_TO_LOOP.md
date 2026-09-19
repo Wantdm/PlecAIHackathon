@@ -41,6 +41,12 @@ today. Please keep that shape.
 
 Also read: `city, date, guestCount, guest {name, email}, pending`.
 
+`BOOKING: BK-1001` tag lines (parts.js) render a reservation card from
+`state.bookings[ref]`. `remember()` stores results that carry a top-level
+`ref`, so `list_bookings` results (`{ bookings: [...] }`) are not stored and
+get no card. If you want "what did I book?" to show cards straight from
+`list_bookings`, store each entry of `result.bookings` by its `ref` too.
+
 ## 4. The event contract in the behaviour brief does not exist here
 
 The brief describes `needs_confirmation` / `clarification_needed` / `error` /

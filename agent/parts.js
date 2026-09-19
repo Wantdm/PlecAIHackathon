@@ -13,7 +13,7 @@
  * Tag lines the model appends to ask for rich parts; stripped before display.
  * Tolerates the model wrapping the tag in markdown (`**CARDS:** a, b`).
  */
-const TAG_LINE = /^[\s*_`]*(CARDS|PHOTOS|MAP)[*_`]*\s*:.*$/gim;
+const TAG_LINE = /^[\s*_`]*(CARDS|PHOTOS|MAP|BOOKING)[*_`]*\s*:.*$/gim;
 
 /** Two or three options, then "show more": more than this overwhelms. */
 const MAX_CARDS = 3;
@@ -30,10 +30,13 @@ export function toParts(text, session) {
   const cardIds = idsFrom(raw, 'CARDS').slice(0, MAX_CARDS);
   const photoIds = idsFrom(raw, 'PHOTOS');
   const mapIds = idsFrom(raw, 'MAP');
+  const bookingRefs = idsFrom(raw, 'BOOKING');
   const clean = plainText(raw.replace(TAG_LINE, ''));
 
   // The contract requires at least one text part on every turn.
   const parts = [{ kind: 'text', text: clean || 'Sorry, could you say that again?' }];
+
+  for (const ref of bookingRefs) parts.push(...bookingParts(ref, session?.state));
 
   const carded = new Set();
   for (const id of cardIds) {
@@ -126,6 +129,65 @@ function lookup(seen, key) {
   if (seen[key]) return seen[key];
   const k = key.toLowerCase();
   return Object.values(seen).find((l) => l?.id?.toLowerCase() === k || l?.name?.toLowerCase() === k) ?? null;
+}
+
+/** Booking statuses in words a guest understands. Anything else is shown as-is. */
+const STATUS_WORDS = {
+  pending_payment: 'waiting for payment',
+  requested: 'waiting for the host to approve',
+  confirmed: 'confirmed',
+  cancelled: 'cancelled',
+};
+
+/**
+ * A reservation as a card, built only from the booking object a tool returned
+ * (the loop keeps each one in state.bookings, refreshed by get_booking, cancel
+ * and reschedule). The title is the listing's exact name so cardsOnlyFrom still
+ * holds; every subtitle fact is a field of that booking. No booking, no card.
+ */
+function bookingParts(ref, state) {
+  const bookings = state?.bookings ?? {};
+  const booking = bookings[ref] ?? Object.values(bookings).find((b) => b?.ref?.toLowerCase() === String(ref).toLowerCase());
+  if (!booking) return [];
+
+  const listing = state?.seen?.[booking.listingId];
+  const title = booking.listingName ?? listing?.name;
+  if (!title) return [];
+
+  const subtitle = [
+    booking.ref,
+    booking.date ? longDate(booking.date) : null,
+    booking.startTime && booking.endTime ? `${clock(booking.startTime)} to ${clock(booking.endTime)}` : null,
+    Number.isFinite(booking.guestCount) ? `${booking.guestCount} people` : null,
+    Number.isFinite(booking.totalCents) ? dollars(booking.totalCents) : null,
+    booking.status ? STATUS_WORDS[booking.status] ?? booking.status : null,
+  ]
+    .filter(Boolean)
+    .join(', ');
+
+  const card = { kind: 'card', title, subtitle, photoUrls: listing?.photoUrls ?? [] };
+  if (listing?.mapUrl) card.url = listing.mapUrl;
+  const parts = [card];
+
+  if (booking.status === 'pending_payment' && booking.payment?.url && booking.payment.status !== 'paid') {
+    parts.push({ kind: 'link', label: `Pay for ${booking.ref}`, url: booking.payment.url });
+  }
+  return parts;
+}
+
+/** 2026-11-25 -> Wednesday, November 25 */
+function longDate(iso) {
+  const d = new Date(`${iso}T00:00:00Z`);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', timeZone: 'UTC' });
+}
+
+/** 18:00 -> 6:00pm, 09:30 -> 9:30am */
+function clock(hhmm) {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(hhmm);
+  if (!m) return hhmm;
+  const h = Number(m[1]);
+  return `${((h + 11) % 12) + 1}:${m[2]}${h < 12 ? 'am' : 'pm'}`;
 }
 
 /**

@@ -57,6 +57,22 @@ const cases = [
   ['MAP gives a link to mapUrl', () => toParts('x\nMAP: foundry-fishtown', session).some((p) => p.kind === 'link' && p.url === seen['foundry-fishtown'].mapUrl)],
   ['Empty model text still yields a text part', () => textOf(toParts('', session)).length > 0],
   ['dollars() and card url', () => dollars(181500) === '$1,815.00' && cardFor(seen['foundry-fishtown']).url === seen['foundry-fishtown'].mapUrl],
+  ['BOOKING builds a card from state.bookings with the exact listing name, plus a pay link', () => {
+    const state = { seen, bookings: { 'BK-1001': { ref: 'BK-1001', listingId: 'foundry-fishtown', listingName: 'The Foundry at Fishtown', status: 'pending_payment', date: '2026-11-25', startTime: '18:00', endTime: '23:00', guestCount: 40, totalCents: 181500, payment: { url: PAY, status: 'unpaid' } } } };
+    const parts = toParts(`Booked. Pay here: ${PAY}\nBOOKING: BK-1001`, { state });
+    const card = parts.find((p) => p.kind === 'card');
+    const link = parts.find((p) => p.kind === 'link');
+    return textOf(parts) === `Booked. Pay here: ${PAY}`
+      && card.title === 'The Foundry at Fishtown'
+      && card.subtitle === 'BK-1001, Wednesday, November 25, 6:00pm to 11:00pm, 40 people, $1,815.00, waiting for payment'
+      && link?.url === PAY && link.label === 'Pay for BK-1001';
+  }],
+  ['BOOKING for an unknown reference builds nothing', () => toParts('x\nBOOKING: BK-9999', { state: { seen, bookings: {} } }).length === 1],
+  ['Requested booking: host wording, no pay link', () => {
+    const state = { seen: {}, bookings: { 'BK-1002': { ref: 'BK-1002', listingName: 'Old City Ballroom', status: 'requested', date: '2026-11-14', startTime: '17:00', endTime: '22:00', guestCount: 100, totalCents: 363000, payment: null } } };
+    const parts = toParts('x\nBOOKING: bk-1002', { state });
+    return parts.some((p) => p.kind === 'card' && p.subtitle.endsWith('waiting for the host to approve') && p.subtitle.includes('5:00pm to 10:00pm')) && !parts.some((p) => p.kind === 'link');
+  }],
   ['Prompt restates reservations made this conversation', () =>
     systemPrompt({ state: { bookings: { 'BK-1001': { ref: 'BK-1001', listingName: 'The Foundry at Fishtown', date: '2026-10-10', startTime: '18:00', endTime: '23:00', guestCount: 40, status: 'pending_payment' } } } }).includes('BK-1001: The Foundry at Fishtown')],
   ['Prompt calendar has the right weekday for October 10, 2026', () => systemPrompt({ state: {} }).includes('2026-10-10 Sat')],
