@@ -83,6 +83,27 @@ function isTransient(result) {
 const AFFIRMATIVE =
   /\b(yes|yeah|yep|yup|ok|okay|sure|confirm|confirmed|correct|agreed|perfect|sounds good|go ahead|do it|please do|let'?s do it|s[íi]|claro|adelante|dale|hazlo|perfecto|de acuerdo)\b/i;
 
+/**
+ * A yes that is not really a yes.
+ *
+ * "yes I think so", "ok, is that the one near the river?" and "sure, but make it
+ * 7pm" all contain an affirmative and none of them is permission to spend the
+ * user's money. A question mark is the clearest tell: someone still asking is
+ * not someone who has decided. Neither is "but" — that is a change of terms, and
+ * the terms they are agreeing to are no longer the ones we quoted.
+ *
+ * Raised by the behaviour half (HANDOFF_TO_LOOP.md), who was told judges would
+ * stress exactly these phrasings. Spanish hedges are here for the same reason the
+ * Spanish affirmatives are.
+ */
+const HEDGED =
+  /\b(think so|thinking|maybe|probably|i guess|not sure|unsure|perhaps|might|possibly|almost|tal vez|quiz[áa]s?|creo que|no s[ée])\b|\?|\bbut\b|\bexcept\b|\bpero\b/i;
+
+/** Permission to change real state: an affirmative, and no hedge anywhere near it. */
+function clearYes(text) {
+  return AFFIRMATIVE.test(text) && !HEDGED.test(text);
+}
+
 /** What to tell the model when it reached for a write without a yes. */
 const NEEDS_CONFIRMATION = {
   book: 'Nothing was booked. Quote the exact total first, show it to the user, make sure you have their name and email, and ask them to confirm before you book.',
@@ -200,9 +221,35 @@ async function runToolCall(call, session, turn) {
   const args = parseToolArguments(call.argumentsJson);
   const isWrite = WRITE_TOOLS.has(call.name);
 
-  if (isWrite && !AFFIRMATIVE.test(turn.text)) {
+  if (isWrite && !clearYes(turn.text)) {
     session.state.pending = { kind: call.name, args };
-    return { call, result: { error: 'confirmation_required', message: NEEDS_CONFIRMATION[call.name] } };
+    const hedging = AFFIRMATIVE.test(turn.text);
+    return {
+      call,
+      result: {
+        error: 'confirmation_required',
+        message: hedging
+          ? `${NEEDS_CONFIRMATION[call.name]} The user's last message sounds like a yes but is not a clear one — they are still asking something, or changing a detail. Answer what they actually said first, then ask for a plain yes.`
+          : NEEDS_CONFIRMATION[call.name],
+      },
+    };
+  }
+
+  // "What did I book?" must show the user's reservations, not the team's. The
+  // sandbox scopes bookings per team, so an unfiltered list would show a
+  // stranger's booking to whoever asks.
+  if (call.name === 'list_bookings' && !args.guestEmail) {
+    const known = session.state.guest?.email;
+    if (!known) {
+      return {
+        call,
+        result: {
+          error: 'email_required',
+          message: 'Ask the user which email the reservation is under before listing any bookings. Do not list bookings you cannot attribute to them.',
+        },
+      };
+    }
+    args.guestEmail = known;
   }
 
   // A model that calls the same tool with the same arguments twice in one turn

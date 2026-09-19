@@ -267,6 +267,42 @@ test('"cancel BK-9001" is a request, not a confirmation', async () => {
   expect(log.filter((e) => e.method === 'POST').length === 0, 'nothing was cancelled');
 });
 
+test('a hedged yes is not a yes', async () => {
+  const hedges = ['yes I think so', 'ok, is that the one near the river?', 'sure, but make it 7pm', 'yes maybe, probably fine'];
+  for (const text of hedges) {
+    const { log } = await turn(text, {
+      llm: [calls({ name: 'book', args: { listingId: 'lst_foundry', date: '2026-10-10' } }), says('Let me be sure first. Shall I book it?')],
+      sandbox: () => booking(),
+      session: { messages: [], state: { pending: { kind: 'book' } } },
+    });
+    expect(writes(log).length === 0, `"${text}" did not book`);
+  }
+});
+
+test('a clear yes still books', async () => {
+  const { log } = await turn('Yes, go ahead and book it for Sam Rivera, sam@example.com.', {
+    llm: [calls({ name: 'book', args: { listingId: 'lst_foundry', date: '2026-10-10', guestEmail: 'sam@example.com' } }), says('Booked, BK-9001. Send the link?')],
+    sandbox: () => booking(),
+  });
+  expect(writes(log).length === 1, 'an unhedged yes with details books in one turn');
+});
+
+test('bookings are never listed without an email to attribute them to', async () => {
+  const cold = await turn('What did I book?', {
+    llm: [calls({ name: 'list_bookings', args: {} }), says('Which email is the reservation under?')],
+    sandbox: () => ({ bookings: [booking({ guestEmail: 'someone.else@example.com' })] }),
+  });
+  expect(sandboxCalls(cold.log, '/bookings').length === 0, 'it asked instead of listing the team\'s bookings');
+
+  const known = await turn('What did I book?', {
+    llm: [calls({ name: 'list_bookings', args: {} }), says('One booking on October 10. Want the details?')],
+    sandbox: () => ({ bookings: [booking()] }),
+    session: { messages: [], state: { guest: { name: 'Sam Rivera', email: 'sam@example.com' } } },
+  });
+  const sent = sandboxCalls(known.log, '/bookings')[0];
+  expect(sent && sent.query.guestEmail === 'sam@example.com', 'with an email on file it filters by it');
+});
+
 // ---------------------------------------------------------------- loop safety
 
 test('a repeated identical tool call is refused, not run again', async () => {
