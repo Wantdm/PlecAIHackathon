@@ -101,6 +101,27 @@ Both of these cost real debugging time. They are not in the repo's own docs —
   bookings. Say so in the group chat before you run it.
 - **The model proxy is shared across every team** and capped per 5-minute
   window. If you are iterating hot, expect 429s that are not your bug.
+- **A failing suite is usually the cap, not a regression.** There are two limits,
+  both per team per 5 minutes: **40 requests** and **150,000 tokens**. Running two
+  suites back to back exhausts the token one, and the failures that follow look
+  exactly like broken behaviour — cards vanish and facts go missing, because
+  every model call 429s. This happened twice in one afternoon and both times the
+  suite was back to 7 of 7 after the window reset, with no code change.
+
+  Before believing a regression, check the log:
+
+  ```sh
+  grep -o '"message":"[^"]*"' /tmp/agent.log | tail -2
+  ```
+
+  `npm test` alone is roughly 40k tokens. `npm run test:edge` and the behaviour
+  evals are free — they mock the model and the sandbox, so run those freely and
+  save the live suite for when it matters.
+- **Do not kill the agent with `lsof -ti:8787 | xargs kill`.** `lsof` on that port
+  matches everything *connected* to it, which includes `cloudflared`. That kills
+  the tunnel along with the server, and a restarted quick tunnel gets a **new
+  random hostname**, so the URL submitted on the dashboard goes dead. Use
+  `pkill -f "node agent/server.js"` instead.
 - Keys live in `.env`, which is gitignored. Never commit a key, and never paste
   one into a file under version control.
 
