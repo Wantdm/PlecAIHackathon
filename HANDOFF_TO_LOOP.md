@@ -72,3 +72,10 @@ With the 150k-token / 5-minute team cap, long conversations (history grows
 too) can hit `token_quota_exceeded` during judging. If that shows up, trimming
 old tool results from `session.messages` (keep the last few) is the cheapest fix
 on the loop side.
+
+## 7. Fallback cards can exceed three
+
+`buildParts` in agent.js caps its fallback at `MAX_CARDS = 5`. When the model
+emits no `CARDS:` line, a search reply can show 4 or 5 cards (seen live on the
+"wheelchair accessible venue for 30 people" turn). The prompt and parts.js aim
+for 2 or 3 plus "show more". Suggest `MAX_CARDS = 3` in agent.js.
