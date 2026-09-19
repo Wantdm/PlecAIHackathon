@@ -166,6 +166,29 @@
   .send svg { width: 16px; height: 16px; }
   .fine { margin: 6px 0 0; text-align: center; font-size: 10px; line-height: 1.3; color: var(--faint); }
   .fine code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  /* The tool trace. Shown under a reply so a reader can see that a price came
+     from a quote and a capacity from the catalogue, rather than from the model. */
+  .trace { margin: 2px 0 6px; font-size: 12.5px; }
+  .trace summary {
+    cursor: pointer; color: var(--muted); list-style: none;
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 3px 9px; border-radius: 999px;
+    border: 1px solid var(--ring); background: rgba(255,255,255,0.6);
+  }
+  .trace summary::-webkit-details-marker { display: none; }
+  .trace summary:hover { color: var(--ink); }
+  .trace[open] summary { margin-bottom: 6px; }
+  .trace ol { margin: 0; padding: 0 0 0 2px; list-style: none; }
+  .trace li {
+    display: grid; grid-template-columns: 14px auto 1fr auto; gap: 8px;
+    align-items: baseline; padding: 4px 8px; border-left: 2px solid var(--ring);
+  }
+  .trace li + li { margin-top: 2px; }
+  .trace .tool { font-weight: 600; color: var(--navy); }
+  .trace .out { color: var(--muted); overflow-wrap: anywhere; }
+  .trace .ms { color: var(--faint); font-variant-numeric: tabular-nums; }
+  .trace .ok { color: #2e7d32; }
+  .trace .bad { color: var(--brand-700); }
 </style>
 </head>
 <body>
@@ -263,10 +286,75 @@
       if (part.caption) el.appendChild(node('figcaption', '', part.caption));
       return el;
     },
+    /**
+     * The tools this turn ran, with what each one returned. Not a contract part
+     * kind: the server sends it alongside `parts` and the log carries it as an
+     * entry so it lands in the right place in the conversation.
+     */
+    trace(part) {
+      const rows = Array.isArray(part.trace) ? part.trace : [];
+      const el = document.createElement('details');
+      el.className = 'trace';
+
+      const summary = document.createElement('summary');
+      const failed = rows.filter((r) => !r.ok).length;
+      summary.textContent = rows.length === 1
+        ? `1 tool call${failed ? ', 1 failed' : ''}`
+        : `${rows.length} tool calls${failed ? `, ${failed} failed` : ''}`;
+      el.appendChild(summary);
+
+      const list = document.createElement('ol');
+      for (const row of rows) {
+        const li = document.createElement('li');
+        const mark = node('span', row.ok ? 'ok' : 'bad', row.ok ? '✓' : '✗');
+        li.appendChild(mark);
+        li.appendChild(node('span', 'tool', row.tool));
+        li.appendChild(node('span', 'out', describe(row)));
+        li.appendChild(node('span', 'ms', `${row.ms}ms`));
+        list.appendChild(li);
+      }
+      el.appendChild(list);
+      return el;
+    },
     unknown(part) {
       return node('div', 'bubble', `[${part && part.kind ? part.kind : 'unknown'} part]`);
     },
   };
+
+  /** One readable line for a trace row: the arguments that mattered, then the result. */
+  function describe(row) {
+    const out = row.outcome || {};
+    if (!row.ok) return out.error ? `${out.error}: ${out.message || ''}`.trim() : 'failed';
+
+    const asked = Object.entries(row.args || {})
+      .filter(([, v]) => v !== undefined && v !== null && v !== '')
+      .map(([k, v]) => `${k}=${typeof v === 'object' ? JSON.stringify(v) : v}`)
+      .join(' ');
+
+    let said;
+    if (out.matched !== undefined) {
+      said = `${out.matched} match${out.matched === 1 ? '' : 'es'}`;
+      if (out.relaxed) said += ` after relaxing ${out.relaxed}`;
+      if (out.names && out.names.length) said += `: ${out.names.join(', ')}`;
+    } else if (out.ref) {
+      said = [out.ref, out.status, out.totalCents !== undefined ? money(out.totalCents) : null,
+        out.idempotent ? 'already existed' : null, out.reconciled ? 'reconciled' : null,
+        out.rolledBack ? 'rolled back' : null].filter(Boolean).join(' · ');
+    } else if (out.totalCents !== undefined) {
+      said = money(out.totalCents);
+    } else if (out.listing) {
+      said = out.capacity ? `${out.listing} (${out.capacity.min}-${out.capacity.max})` : out.listing;
+    } else if (out.bookings !== undefined) {
+      said = `${out.bookings} booking${out.bookings === 1 ? '' : 's'}`;
+    } else {
+      said = 'ok';
+    }
+    return asked ? `${asked} → ${said}` : said;
+  }
+
+  function money(cents) {
+    return '$' + (cents / 100).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
 
   function render(part) {
     const draw = renderers[part && part.kind] || renderers.unknown;
@@ -350,6 +438,10 @@
       if (!res.ok) throw new Error(body.message || body.error || `HTTP ${res.status}`);
       const parts = Array.isArray(body.parts) ? body.parts : [];
       if (parts.length === 0) throw new Error('The agent returned no parts');
+      // The trace goes above the reply: it is how the answer was arrived at.
+      if (Array.isArray(body.trace) && body.trace.length > 0) {
+        entries.push({ role: 'agent', part: { kind: 'trace', trace: body.trace } });
+      }
       for (const part of parts) entries.push({ role: 'agent', part });
     } catch (err) {
       mine.failed = true;

@@ -57,9 +57,13 @@ async function handleMessage(req, res) {
   if (!text) return json(res, 400, { error: 'text_required', message: 'text must be a non-empty string' });
 
   const startedAt = Date.now();
+  const session = getSession(sessionId);
+  // Where this turn's tool calls start in the session trace, so the reply can
+  // carry just this turn's. Read before respond() runs, obviously.
+  const traceFrom = session.state?.trace?.length ?? 0;
   let parts;
   try {
-    parts = await withDeadline(respond({ sessionId, text, session: getSession(sessionId) }), TURN_DEADLINE_MS);
+    parts = await withDeadline(respond({ sessionId, text, session }), TURN_DEADLINE_MS);
   } catch (err) {
     const timedOut = err?.code === 'DEADLINE';
     console.error(`[turn ${sessionId.slice(0, 8)}] failed after ${Date.now() - startedAt}ms:`, timedOut ? err.message : err);
@@ -74,7 +78,12 @@ async function handleMessage(req, res) {
     console.warn(`[turn ${sessionId.slice(0, 8)}] reply has no text part; the contract asks for at least one`);
   }
   console.log(`[turn ${sessionId.slice(0, 8)}] ${Date.now() - startedAt}ms  "${text.slice(0, 60)}" -> ${clean.map((p) => p.kind).join(',')}`);
-  return json(res, 200, { parts: clean });
+
+  // `parts` is the contract (docs/contract.md) and is unchanged. `trace` is an
+  // extra key the chat page reads to show which tool produced which fact; an
+  // evaluator that only knows about `parts` is unaffected by it.
+  const trace = (session.state?.trace ?? []).slice(traceFrom);
+  return json(res, 200, { parts: clean, trace, ms: Date.now() - startedAt });
 }
 
 async function handleReset(req, res) {
