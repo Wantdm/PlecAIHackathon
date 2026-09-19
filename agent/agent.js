@@ -129,7 +129,16 @@ export async function respond({ sessionId, text, session }) {
     return await runTurn({ text, session, deadline });
   } catch (err) {
     console.error(`[agent ${sessionId.slice(0, 8)}]`, err);
-    const apology = 'Something went wrong on my side just now. Could you try that once more?';
+
+    // A rate limit is not a mystery, and saying "something went wrong" invites
+    // the user to retry straight into the same wall. Tell them how long.
+    const after = retryAfter(err);
+    const apology =
+      after === null
+        ? 'Something went wrong on my side just now. Could you try that once more?'
+        : after > 0
+          ? `I have hit my request limit for the moment. Could you ask me again in about ${after} seconds?`
+          : 'I have hit my request limit for the moment. Could you ask me again in a minute?';
     session.messages.length = mark;
     session.messages.push({ role: 'user', content: text });
     session.messages.push({ role: 'assistant', content: apology });
@@ -203,11 +212,30 @@ async function askModel(session, remainingMs, withTools) {
     try {
       return await withTimeout(chatCompletion(messages, options), left);
     } catch (err) {
-      const busy = /\b(429|rate|too many)\b/i.test(err?.message ?? '') || err?.status === 429;
-      if (!busy || attempt >= 1 || left < RETRY_FLOOR_MS * 2) throw err;
-      await sleep(BACKOFF_BASE_MS + Math.random() * BACKOFF_MAX_MS);
+      const after = retryAfter(err);
+      if (after === null || attempt >= 1) throw err;
+
+      // The proxy says exactly how long the window has left. Wait it out only if
+      // it fits with room to answer afterwards; a 29s reset does not fit a 32s
+      // turn, and pretending otherwise just burns the turn before failing.
+      const wait = after > 0 ? after * 1000 + 250 : BACKOFF_BASE_MS + Math.random() * BACKOFF_MAX_MS;
+      if (wait > left - RETRY_FLOOR_MS) throw err;
+      await sleep(wait);
     }
   }
+}
+
+/**
+ * Seconds until the rate-limit window resets, or null if this was not a 429.
+ *
+ * The proxy is shared by every team and capped at 40 requests per five minutes,
+ * so this is a normal condition during judging, not an exception.
+ */
+function retryAfter(err) {
+  const busy = err?.status === 429 || /\b(429|rate_limit|rate limit|too many)\b/i.test(err?.message ?? '');
+  if (!busy) return null;
+  const seconds = Number(/"retryAfterSeconds"\s*:\s*(\d+)/.exec(err?.body ?? err?.message ?? '')?.[1]);
+  return Number.isFinite(seconds) ? seconds : 0;
 }
 
 /**
