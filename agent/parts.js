@@ -15,8 +15,8 @@
  */
 const TAG_LINE = /^[\s*_`]*(CARDS|PHOTOS|MAP)[*_`]*\s*:.*$/gim;
 
-/** More cards than this is a brochure, not an answer. */
-const MAX_CARDS = 8;
+/** Two or three options, then "show more": more than this overwhelms. */
+const MAX_CARDS = 3;
 
 /**
  * @param {string} text  the model's final answer
@@ -112,6 +112,11 @@ export function plainText(text) {
     .replace(/^[ \t]+/gm, '')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+
+  // Never echo a card number or Social Security number back, even if the user typed one.
+  out = out
+    .replace(/\b\d{3}-\d{2}-\d{4}\b/g, '[removed]')
+    .replace(/\b\d(?:[ -]?\d){12,18}\b/g, '[removed]');
 
   return out.replace(/\u0000(\d+)\u0000/g, (_, i) => urls[Number(i)]);
 }
