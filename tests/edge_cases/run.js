@@ -335,6 +335,34 @@ test('a model outage becomes an apology, not a 500', async () => {
   expect(text.trim().length > 0, 'still words');
 });
 
+test('a rate limit says how long, and still reports what the tools found', async () => {
+  // The tools answer, then the model call that would write the prose is capped.
+  const llm = [
+    calls({ name: 'get_listing', args: { id: 'lst_foundry' } }, { name: 'quote', args: { listingId: 'lst_foundry', date: '2026-10-10' } }),
+    { status: 429, body: { error: 'rate_limit_exceeded', message: 'Your team has used all 40 requests for this 5 minute window.', retryAfterSeconds: 29 } },
+  ];
+  const { text, parts } = await turn('How many fit and what does 6pm to 11pm cost?', {
+    llm,
+    sandbox: (method, path) => {
+      if (path.includes('/quote')) return { quoteId: 'q1', totalCents: 181500 };
+      return { id: 'lst_foundry', name: 'The Foundry at Fishtown', neighborhood: 'Fishtown', capacity: { min: 40, max: 150 } };
+    },
+  });
+  expect(/29 seconds/.test(text), 'it says how long the wait is');
+  expect(/40 to 150/.test(text), 'the capacity the tool returned still reaches the user');
+  expect(text.includes('$1,815.00'), 'so does the exact quoted total');
+  expect(parts.some((p) => p.kind === 'card' && p.title === 'The Foundry at Fishtown'), 'and the card survives too');
+});
+
+test('a rate limit with nothing fetched just apologises', async () => {
+  const { text } = await turn('hello?', {
+    llm: [{ status: 429, body: { error: 'rate_limit_exceeded', message: 'rate_limit_exceeded', retryAfterSeconds: 12 } }],
+    sandbox: () => ({}),
+  });
+  expect(/12 seconds/.test(text), 'it still says how long');
+  expect(!/\$/.test(text), 'and invents no facts it never fetched');
+});
+
 test('history is left usable after a failed turn', async () => {
   const session = { messages: [], state: {} };
   await turn('Hello?', { llm: [{ status: 500, body: {} }], sandbox: () => ({}), session });

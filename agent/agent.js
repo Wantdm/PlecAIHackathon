@@ -27,7 +27,7 @@
 import { chatCompletion, parseToolArguments } from './llm.js';
 import { callTool, tools } from './plec.js';
 import { systemPrompt } from './prompt.js';
-import { toParts, cardFor } from './parts.js';
+import { toParts, cardFor, dollars } from './parts.js';
 
 /** server.js gives up at 40s. Stay well inside it: a late answer is no answer. */
 const TURN_BUDGET_MS = 32_000;
@@ -124,38 +124,49 @@ export async function respond({ sessionId, text, session }) {
   // every later request in this session invalid, so a half-written turn must
   // not survive.
   const mark = session.messages.length;
+  const turn = { text, lookedUpIds: [], calls: new Map(), deadline };
 
   try {
-    return await runTurn({ text, session, deadline });
+    return await runTurn({ text, session, deadline, turn });
   } catch (err) {
     console.error(`[agent ${sessionId.slice(0, 8)}]`, err);
 
     // A rate limit is not a mystery, and saying "something went wrong" invites
     // the user to retry straight into the same wall. Tell them how long.
     const after = retryAfter(err);
-    const apology =
+    const wait =
       after === null
         ? 'Something went wrong on my side just now. Could you try that once more?'
         : after > 0
           ? `I have hit my request limit for the moment. Could you ask me again in about ${after} seconds?`
           : 'I have hit my request limit for the moment. Could you ask me again in a minute?';
+
+    // The tools may well have answered before the model ran out of room. Those
+    // are real facts, already paid for, and throwing them away to say "something
+    // went wrong" is the worst of both. Say what we know, then apologise.
+    const facts = factsFromTools(session, turn);
+    const reply = facts ? `${facts}\n\n${wait}` : wait;
+
     session.messages.length = mark;
     session.messages.push({ role: 'user', content: text });
-    session.messages.push({ role: 'assistant', content: apology });
-    return [{ kind: 'text', text: apology }];
+    session.messages.push({ role: 'assistant', content: reply });
+
+    const parts = [{ kind: 'text', text: reply }];
+    for (const listing of cardsFromTools(session, turn)) parts.push(cardFor(listing));
+    return parts;
   }
 }
 
-async function runTurn({ text, session, deadline }) {
+/**
+ * @param turn  what happened during this turn only, as opposed to session.state,
+ *   which is the whole conversation. `lookedUpIds` is what the card fallback
+ *   draws on, so a card is never a leftover from three turns ago. `calls` is this
+ *   turn's tool fingerprints, which is how a stuck model gets told it is
+ *   repeating itself. respond() creates it rather than this function, so that a
+ *   turn which fails on the way out can still answer from what the tools returned.
+ */
+async function runTurn({ text, session, deadline, turn }) {
   session.messages.push({ role: 'user', content: text });
-
-  // What happened during this turn only, as opposed to session.state, which is
-  // the whole conversation. The card fallback needs "what did we look up just
-  // now", so a card is never a leftover from three turns ago.
-  // `calls` is this turn's tool fingerprints, which is how a stuck model gets
-  // told it is repeating itself. `deadline` rides along so a retry can decide
-  // whether there is still room for one.
-  const turn = { text, lookedUpIds: [], calls: new Map(), deadline };
 
   for (let round = 0; round < MAX_ROUNDS; round += 1) {
     const remaining = deadline - Date.now();
@@ -594,6 +605,65 @@ function stableJson(value) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * A plain answer from this turn's tool results, with no model involved.
+ *
+ * Used when the model call fails after the tools have already succeeded — which
+ * is what a rate limit looks like partway through a turn. Every sentence here is
+ * a field of a tool result, so this cannot invent anything; it is the same rule
+ * the prompt follows, applied without the prompt.
+ *
+ * Returns null when the turn learned nothing worth saying, in which case the
+ * caller falls back to the apology alone.
+ */
+function factsFromTools(session, turn) {
+  if (!turn) return null;
+  const state = session.state;
+  const said = [];
+
+  const listing = state.seen?.[turn.lookedUpIds?.[0]];
+  if (listing?.name) {
+    const bits = [];
+    if (listing.capacity) bits.push(`holds ${listing.capacity.min} to ${listing.capacity.max} guests`);
+    if (listing.neighborhood) bits.push(`in ${listing.neighborhood}`);
+    if (bits.length > 0) said.push(`${listing.name} ${bits.join(', ')}.`);
+  }
+
+  const ran = (tool) => [...(turn.calls?.keys?.() ?? [])].some((key) => key.startsWith(`${tool}:`));
+
+  // Only a quote this turn produced: an older one may be for a different slot.
+  const quote = state.lastQuote;
+  if (quote && ran('quote') && Number.isFinite(quote.totalCents)) {
+    said.push(`The all-in total for that slot is ${dollars(quote.totalCents)}, service fee included.`);
+  }
+
+  const ref = state.lastBookingRef;
+  const booking = ref ? state.bookings?.[ref] : null;
+  if (booking && ran('book') && booking.status) {
+    said.push(`Your booking ${booking.ref} is ${booking.status.replace(/_/g, ' ')}.`);
+    if (booking.payment?.url && booking.payment.status !== 'paid') {
+      said.push(`Pay here to confirm it: ${booking.payment.url}`);
+    }
+  }
+
+  return said.length > 0 ? said.join(' ') : null;
+}
+
+/** Listings this turn looked up, as cards. Same source of truth as buildParts. */
+function cardsFromTools(session, turn) {
+  const out = [];
+  const shown = new Set();
+  for (const id of turn?.lookedUpIds ?? []) {
+    const listing = session.state.seen?.[id];
+    if (!listing?.name || shown.has(listing.name)) continue;
+    if (!fitsGroup(listing, session.state.guestCount)) continue;
+    shown.add(listing.name);
+    out.push(listing);
+    if (out.length >= 3) break;
+  }
+  return out;
 }
 
 /** How many listings to enrich for their map link. The cards are capped anyway. */
