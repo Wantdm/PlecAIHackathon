@@ -882,7 +882,22 @@ function buildParts(text, session, turn) {
  */
 function ensureQuestion(parts, session) {
   const texts = parts.filter((part) => part.kind === 'text');
-  if (texts.some((part) => part.text?.includes('?'))) return parts;
+
+  // Not every question mark is ASCII. A Chinese reply ends in a full-width `？`
+  // and Spanish opens with `¿`; missing those appended an English pleasantry to a
+  // conversation that was not in English.
+  if (texts.some((part) => /[?？¿]/.test(part.text ?? ''))) return parts;
+
+  // Some replies must not be followed by small talk. "Call 911 right now, put the
+  // phone on speaker and start CPR" ending in "What else can I help you with?" is
+  // tone-deaf, and the check for it wants 911 and nothing else.
+  if (texts.some((part) => /\b911\b|\b112\b|emergency services/i.test(part.text ?? ''))) return parts;
+
+  // The follow-up below is English. Appending it to a reply written in another
+  // language is worse than having no question at all, so leave those alone: the
+  // prompt already asks the model to end with one in the user's own language.
+  const latin = texts.map((part) => part.text ?? '').join(' ');
+  if (latin.trim() && !/[a-z]/i.test(latin)) return parts;
 
   const state = session.state;
   const question = state.pending

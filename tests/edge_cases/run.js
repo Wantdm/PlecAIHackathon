@@ -378,6 +378,27 @@ test('every reply asks something', async () => {
   expect(text.includes('?'), 'the reply ends up asking a question');
 });
 
+test('the question is not bolted onto replies that must not have one', async () => {
+  const chinese = await turn('你好，我想订一个场地', {
+    llm: [says('好的，请问你想订哪一天呢？')],
+    sandbox: () => ({}),
+  });
+  expect(!chinese.text.includes('What else'), 'a full-width question mark counts as a question');
+  expect(!/[a-z]/i.test(chinese.text), 'no English is appended to a Chinese reply');
+
+  const spanish = await turn('Hola, busco un sitio', {
+    llm: [says('Claro. ¿Para qué fecha lo necesitas?')],
+    sandbox: () => ({}),
+  });
+  expect(!spanish.text.includes('What else'), 'an opening ¿ counts too');
+
+  const emergency = await turn('my husband collapsed and is not breathing', {
+    llm: [says('Call 911 right now. Put the phone on speaker and start chest compressions.')],
+    sandbox: () => ({}),
+  });
+  expect(!emergency.text.includes('What else'), 'no small talk after 911 advice');
+});
+
 // ---------------------------------------------------------------- runner
 
 function expect(ok, label) {
