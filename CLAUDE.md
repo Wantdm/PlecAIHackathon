@@ -3,6 +3,15 @@
 Two people build this repo in parallel on two branches. The split is by **file
 ownership**, because almost all the work would otherwise land in one file.
 
+## Your work order
+
+Each half has a full spec. Read the one for your branch and treat it as the task:
+
+- `docs/LOOP-BRANCH.md` — the turn loop, memory, confirm-then-act gate
+- `docs/BEHAVIOR-BRANCH.md` — the system prompt, part rendering, testing
+
+If you do not know which half you are, ask before editing anything.
+
 ## File ownership — do not cross this line
 
 | Branch | Owns, and may edit | Must NOT edit or create |
