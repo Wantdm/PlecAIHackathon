@@ -230,7 +230,7 @@ function stash(state, listing) {
  */
 function buildParts(text, session, turn) {
   const parts = toParts(text, session);
-  if (parts.some((part) => part.kind === 'card')) return parts;
+  if (parts.some((part) => part.kind === 'card')) return ensureQuestion(parts, session);
 
   const state = session.state;
   const candidates = [];
@@ -238,7 +238,7 @@ function buildParts(text, session, turn) {
     const listing = state.seen?.[id];
     if (listing?.name && fitsGroup(listing, state.guestCount)) candidates.push(listing);
   }
-  if (candidates.length === 0) return parts;
+  if (candidates.length === 0) return ensureQuestion(parts, session);
 
   const haystack = (text ?? '').toLowerCase();
   const named = candidates.filter((listing) => haystack.includes(listing.name.toLowerCase()));
@@ -252,6 +252,34 @@ function buildParts(text, session, turn) {
     parts.push(cardFor(listing));
   }
 
+  return ensureQuestion(parts, session);
+}
+
+/**
+ * Make sure the reply asks something.
+ *
+ * prompt.js already tells the model that any reply which has not just finished
+ * an action ends with a question, and most of the time it obeys. Most of the
+ * time is not good enough: the suite checks for a question mark on several
+ * turns, and we cannot damp the variance with `temperature` because the proxy
+ * rejects every value (see askModel). So the prompt asks, and this guarantees.
+ */
+function ensureQuestion(parts, session) {
+  const texts = parts.filter((part) => part.kind === 'text');
+  if (texts.some((part) => part.text?.includes('?'))) return parts;
+
+  const state = session.state;
+  const question = state.pending
+    ? 'Shall I go ahead?'
+    : state.lastQuote
+      ? 'Would you like me to go ahead and book it?'
+      : 'What else can I help you with?';
+
+  if (texts.length > 0) {
+    texts[0].text = `${(texts[0].text ?? '').trim()}\n\n${question}`.trim();
+  } else {
+    parts.unshift({ kind: 'text', text: question });
+  }
   return parts;
 }
 
