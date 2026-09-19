@@ -66,6 +66,34 @@ interaction quality, so these are not style preferences:
 - A booking stays unpaid until the guest pays the Checkout link. Never claim
   payment happened, and never try to pay for them.
 
+## Model and proxy settings (verified the hard way)
+
+Both of these cost real debugging time. They are not in the repo's own docs —
+`docs/harness.md` and `docs/model-proxy.md` are wrong on the first one.
+
+- **Never send `temperature`.** `docs/harness.md` tells you to use
+  `temperature: 0` for steadier tool arguments, and `docs/model-proxy.md` even
+  shows it in an example body. `kimi-k2.6` on PLEC's proxy answers **HTTP 400 to
+  every temperature except 1** — verified across 0, 0.1, 0.3, 0.6 and 1. Omit
+  the field entirely.
+- **Use `LLM_MODEL=kimi-k2.7-code-highspeed`.** The default `kimi-k2.6` is a
+  reasoning model that burns ~800 characters of hidden reasoning per call. The
+  highspeed variant is roughly 6x faster on the same work with the same tool
+  choices, and the public suite stays at 7 of 7:
+
+  | turn | kimi-k2.6 | kimi-k2.7-code-highspeed |
+  | --- | --- | --- |
+  | vague opener | 5.3s | 1.6s |
+  | venue search | 26.0s | 4.3s |
+  | capacity question | 11.8s | 3.1s |
+  | quote and confirm | 19.5s | 4.8s |
+
+  Spanish replies still come back in Spanish, so the "code" in the name does not
+  cost conversational quality here.
+
+  **`.env` is gitignored, so this setting does not travel through git.** Each
+  person has to set it in their own `.env`.
+
 ## Hazards specific to this setup
 
 - **`npm test` resets the shared team sandbox.** Booking state is per *team*,
